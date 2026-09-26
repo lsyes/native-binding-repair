@@ -222,4 +222,4 @@ headers are missing.
 
 ## License
 
-MIT
+GPL-3.0
