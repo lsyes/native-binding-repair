@@ -1,0 +1,41 @@
+{
+  "name": "native-binding-repair",
+  "version": "0.1.0",
+  "description": "Diagnose and automatically repair missing or unloadable native Node.js bindings: build prebuilds for unsupported platforms/architectures, or fall back to WebAssembly.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "bin": {
+    "nbr": "bin/nbr.js",
+    "native-binding-repair": "bin/nbr.js"
+  },
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./preload": "./lib/preload.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "vendor",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node test/run.js",
+    "doctor": "node bin/nbr.js doctor"
+  },
+  "keywords": [
+    "native",
+    "addon",
+    "prebuild",
+    "binding",
+    "sharp",
+    "loongarch",
+    "loong64",
+    "node-gyp",
+    "wasm"
+  ]
+}
