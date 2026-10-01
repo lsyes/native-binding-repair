@@ -1,0 +1,3 @@
+[submodule "vendor/node-addon-require-builtin-src"]
+	path = vendor/node-addon-require-builtin-src
+	url = https://github.com/deepseek-ai/dsh-node-addon-require-builtin.git

@@ -19,6 +19,13 @@ import { diagnose } from '../lib/diagnose.js';
 import { listVendored, lookupVendored, sharpBinaryName } from '../lib/vendor.js';
 import { linuxLibc, platformSuffix, sharpPlatform, nodeAbi } from '../lib/runtime.js';
 import { sharpBindingFilename, isPrebuiltPlatform } from '../lib/recipes/sharp.js';
+import {
+  REQUIRE_BUILTIN_UPSTREAM_SRC,
+  applyRequireBuiltinOverlay,
+  probeRequireBuiltin,
+  requireBuiltinBindingPath,
+} from '../lib/recipes/require-builtin.js';
+import { buildRequireBuiltin, locateNodeAddonApi } from '../lib/strategies.js';
 import { installHook, removeHook } from '../lib/hook.js';
 import { createLogger } from '../lib/log.js';
 import { globalModuleRoots } from '../lib/repair.js';
@@ -189,6 +196,74 @@ function findInstalledRipgrepEntry() {
 }
 
 /**
+ * Build a throwaway `node_modules/node-addon-require-builtin` with no local
+ * binding, using the real entry package and its loader from this machine when
+ * they are installed. Returns the scratch root.
+ * @returns {string}
+ */
+function makeFakeRequireBuiltin() {
+  const root = scratch('nbr-rb');
+  const modulesDir = path.join(root, 'node_modules');
+  const packageDir = path.join(modulesDir, 'node-addon-require-builtin');
+  fs.mkdirSync(packageDir, { recursive: true });
+  const source = findInstalledRequireBuiltinEntry();
+  if (source) {
+    for (const file of ['package.json', 'lib', 'LICENSE', 'README.md']) {
+      const from = path.join(source, file);
+      if (fs.existsSync(from)) fs.cpSync(from, path.join(packageDir, file), { recursive: true });
+    }
+    // `lib/index.js` loads `node-addon-native-custom-loader` at require time.
+    const loader = path.join(path.dirname(source), 'node-addon-native-custom-loader');
+    if (fs.existsSync(loader)) {
+      fs.cpSync(loader, path.join(modulesDir, 'node-addon-native-custom-loader'), { recursive: true });
+    }
+  } else {
+    // A stand-in with the same resolution behaviour keeps the placement
+    // assertions meaningful on machines without the real package installed.
+    fs.mkdirSync(path.join(packageDir, 'lib'), { recursive: true });
+    fs.writeFileSync(
+      path.join(packageDir, 'package.json'),
+      JSON.stringify({ name: 'node-addon-require-builtin', version: '0.1.6', main: 'lib/index.js' }, null, 2),
+    );
+    fs.writeFileSync(path.join(packageDir, 'lib', 'index.js'), [
+      "'use strict';",
+      "const path = require('node:path');",
+      `const binding = require(path.join(__dirname, '..', 'build', 'napi', 'napi-v9-${platformSuffix()}', 'require_builtin.node'));`,
+      'exports.requireBuiltin = (id) => binding.requireBuiltin(id);',
+      'exports.isAllowedInternalId = (id) => binding.isAllowedInternalId(id);',
+      'exports.getBindingInfo = () => binding.getNativeBindingInfo();',
+      '',
+    ].join('\n'));
+  }
+  fs.rmSync(path.join(packageDir, 'build'), { recursive: true, force: true });
+  return root;
+}
+
+/**
+ * Find a real `node-addon-require-builtin` entry package to copy fixtures from.
+ * @returns {string | undefined}
+ */
+function findInstalledRequireBuiltinEntry() {
+  const probes = [
+    process.env.NBR_TEST_REQUIRE_BUILTIN_DIR,
+    path.join(
+      path.dirname(process.execPath),
+      '..',
+      'lib',
+      'node_modules',
+      '@deepseek-ai',
+      'dsh',
+      'node_modules',
+      'node-addon-require-builtin',
+    ),
+  ].filter(Boolean);
+  for (const candidate of probes) {
+    if (candidate && fs.existsSync(path.join(candidate, 'lib', 'index.js'))) return candidate;
+  }
+  return undefined;
+}
+
+/**
  * Block the thread for a few milliseconds so filesystem timestamps advance.
  * @param {number} ms
  */
@@ -303,6 +378,117 @@ await test('looks up a vendored binding by version', () => {
 
 await test('refuses to hand out a binding for the wrong version', () => {
   assert.equal(lookupVendored('sharp', '9.9.9'), undefined);
+});
+
+process.stdout.write('\nnode-addon-require-builtin\n');
+
+await test('indexes the require-builtin addon built from upstream source', () => {
+  if (sharpPlatform() !== 'linux-loong64') return; // the bundle is arch-specific
+  const entry = listVendored().find(
+    (candidate) => candidate.package === 'node-addon-require-builtin',
+  );
+  assert.ok(entry, 'expected a vendored require_builtin for this platform');
+  assert.equal(entry.kind, 'addon');
+  assert.equal(entry.version, '0.1.6');
+  assert.equal(entry.file, 'require_builtin.node');
+});
+
+await test('repairs a require-builtin install whose binding is missing', () => {
+  if (sharpPlatform() !== 'linux-loong64') return;
+  const root = makeFakeRequireBuiltin();
+  const packageDir = path.join(root, 'node_modules', 'node-addon-require-builtin');
+  const binding = requireBuiltinBindingPath(packageDir, platformSuffix());
+  assert.equal(fs.existsSync(binding), false, 'fixture should start broken');
+
+  runCli(['repair', 'node-addon-require-builtin', '--cwd', root]);
+  assert.equal(fs.existsSync(binding), true, 'binding should be installed');
+
+  // The file existing proves nothing on its own: upstream's
+  // getNativeBindingInfo is a static descriptor, so only a real requireBuiltin
+  // call shows the private runtime probe resolved.
+  const probe = probeRequireBuiltin(packageDir);
+  assert.equal(probe.ok, true, probe.error?.message);
+  assert.match(probe.summary, /requireBuiltin resolved/);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+await test('doctor exits non-zero for a require-builtin install without a binding', () => {
+  if (sharpPlatform() !== 'linux-loong64') return;
+  const root = makeFakeRequireBuiltin();
+  const { status } = runCliResult(['doctor', 'node-addon-require-builtin', '--cwd', root]);
+  assert.equal(status, 1, 'doctor should signal the broken addon');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+await test('the loong64 overlay patches the pinned upstream tree', () => {
+  if (!fs.existsSync(path.join(REQUIRE_BUILTIN_UPSTREAM_SRC, 'node_api_addon.cc'))) return;
+  const root = scratch('nbr-overlay');
+  const srcDir = path.join(root, 'src');
+  fs.cpSync(REQUIRE_BUILTIN_UPSTREAM_SRC, srcDir, { recursive: true });
+
+  applyRequireBuiltinOverlay(srcDir);
+
+  for (const relative of [
+    path.join('runtime_context', 'linux_glibc_loong64.cc'),
+    path.join('runtime_probe', 'linux_glibc_loong64.cc'),
+  ]) {
+    assert.equal(fs.existsSync(path.join(srcDir, relative)), true, `${relative} should be added`);
+  }
+  assert.match(fs.readFileSync(path.join(srcDir, 'runtime_context', 'helper.h'), 'utf8'), /ReadLinuxGlibcLoong64CurrentV8Context/);
+  assert.match(fs.readFileSync(path.join(srcDir, 'runtime_probe', 'parser.h'), 'utf8'), /ParseLinuxGlibcLoong64BuiltinModuleRequireGetterOffset/);
+  assert.match(fs.readFileSync(path.join(srcDir, 'runtime_context', 'platform.cc'), 'utf8'), /__loongarch_lp64[\s\S]*ReadLinuxGlibcLoong64CurrentV8Context/);
+  assert.match(fs.readFileSync(path.join(srcDir, 'runtime_probe', 'platform.cc'), 'utf8'), /__loongarch_lp64[\s\S]*ParseLinuxGlibcLoong64BuiltinModuleRequireGetterOffset/);
+  assert.match(fs.readFileSync(path.join(srcDir, 'native_types.cc'), 'utf8'), /"loong64"/);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+await test('the overlay refuses to patch a tree it does not recognise', () => {
+  const root = scratch('nbr-overlay-bad');
+  const srcDir = path.join(root, 'src');
+  fs.mkdirSync(srcDir, { recursive: true });
+  // A moved upstream revision must fail loudly rather than compile something
+  // subtly different, so an unrecognised tree is an error and not a no-op.
+  assert.throws(() => applyRequireBuiltinOverlay(srcDir), /overlay target is missing/);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+await test('compiles the upstream addon from source for this runtime', () => {
+  if (!fs.existsSync(path.join(REQUIRE_BUILTIN_UPSTREAM_SRC, 'node_api_addon.cc'))) return;
+  const root = makeFakeRequireBuiltin();
+  const packageDir = path.join(root, 'node_modules', 'node-addon-require-builtin');
+  if (!locateNodeAddonApi(packageDir)) {
+    fs.rmSync(root, { recursive: true, force: true });
+    return; // no node-addon-api headers on this machine
+  }
+
+  const report = buildRequireBuiltin({ packageDir, logger: quietLogger });
+  if (report.status === 'skipped') {
+    fs.rmSync(root, { recursive: true, force: true });
+    return; // no toolchain or Node headers on this machine
+  }
+  assert.equal(report.status, 'applied', report.detail);
+
+  const binding = requireBuiltinBindingPath(packageDir, platformSuffix());
+  const probe = probeRequireBuiltin(packageDir, { bindingPath: binding, direct: true });
+  assert.equal(probe.ok, true, probe.error?.message);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+await test('refuses to compile upstream sources into a different package version', () => {
+  if (!fs.existsSync(path.join(REQUIRE_BUILTIN_UPSTREAM_SRC, 'node_api_addon.cc'))) return;
+  const root = makeFakeRequireBuiltin();
+  const packageDir = path.join(root, 'node_modules', 'node-addon-require-builtin');
+  const manifestPath = path.join(packageDir, 'package.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  manifest.version = '9.9.9';
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+
+  // The sources describe one release's addon contract; compiling them into a
+  // different release is refused the same way a sharp prebuild is.
+  const report = buildRequireBuiltin({ packageDir, logger: quietLogger });
+  assert.equal(report.status, 'skipped');
+  assert.match(report.detail, /9\.9\.9/);
+  fs.rmSync(root, { recursive: true, force: true });
 });
 
 process.stdout.write('\nripgrep\n');
@@ -477,6 +663,21 @@ await test('run repairs a broken tree and retries the command', () => {
   );
   assert.equal(status, 0, 'the retry should succeed');
   assert.match(stdout, /OK/);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+await test('run repairs a broken require-builtin tree and retries the command', () => {
+  // The loader names the optional platform package, so this also covers the
+  // wrapper mapping that name back to the entry package it repairs.
+  if (sharpPlatform() !== 'linux-loong64' || !findInstalledRequireBuiltinEntry()) return;
+  const root = makeFakeRequireBuiltin();
+  const probe = "const p=require('node-addon-require-builtin'); "
+    + "console.log('RB-OK', typeof p.requireBuiltin('internal/bootstrap/realm').require)";
+  const { status, stdout } = runCliResult(
+    ['run', '--cwd', root, '--', process.execPath, '-e', probe],
+  );
+  assert.equal(status, 0, 'the retry should succeed');
+  assert.match(stdout, /RB-OK function/);
   fs.rmSync(root, { recursive: true, force: true });
 });
 

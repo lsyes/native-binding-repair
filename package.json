@@ -21,11 +21,13 @@
     "bin",
     "lib",
     "vendor",
+    "!vendor/node-addon-require-builtin-src",
     "README.md"
   ],
   "scripts": {
     "test": "node test/run.js",
-    "doctor": "node bin/nbr.js doctor"
+    "doctor": "node bin/nbr.js doctor",
+    "build:prebuild": "node scripts/build-require-builtin-prebuild.js"
   },
   "keywords": [
     "native",

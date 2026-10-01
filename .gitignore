@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# npm pack / publish artefacts
+*.tgz
+
+# Test and repair scratch directories
+/tmp-nbr/
+.nbr-scratch/
+
+# Editor and OS noise
+.DS_Store
+*.swp
+*~
+
+# Local notes that must never ship in the tarball: package.json `files`
+# already whitelists what is published, and these are outside that list, but
+# ignoring them keeps `git status` honest too.
+/notes/

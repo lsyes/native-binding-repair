@@ -56,7 +56,7 @@ tries the cheapest option first:
 | Order | Strategy | Needs network | Needs compiler | Needs root |
 | --- | --- | --- | --- | --- |
 | 1 | Bundled prebuild for this architecture | no | no | no |
-| 2 | `node-gyp` build against system libraries | no | yes | no |
+| 2 | Compile from source (`node-gyp`, or the upstream sources) | no | yes | no |
 | 3 | Platform optional dependency from the registry | yes | no | no |
 | 4 | WebAssembly fallback | no | no | no |
 
@@ -180,16 +180,62 @@ the `grep` and `glob` tools, so the process starts normally and only the search
 tools fail, with `SEARCH_FAILED` pointing at the tool rather than at the missing
 binary.
 
-## Known cases this tool cannot fix
+## How the require-builtin repair works
 
-Some packages publish no native sources at all and deliberately "fail closed"
-rather than compile an unvalidated binary. `node-addon-require-builtin` (used by
-dsh for its HMR loader) is one: its README states that published installs do not
-ship native sources. There is nothing to build, so the fix belongs with the
-package that depends on it.
+`node-addon-require-builtin` is how `dsh` reaches Node's internal module loader.
+It ships one prebuilt `.node` per platform behind an optional dependency, and
+that list stops at darwin, linux-x64, linux-arm64 and win32: there is no
+loong64 binary, and upstream's installer deliberately fails closed rather than
+compile an unvalidated one at install time. There is a loong64 local-build
+fallback path, though, and `node-addon-native-custom-loader` derives it from
+the runtime, so the repair only has to put a binding there:
 
-For dsh specifically, the HMR plugin needs `--expose-internals`, which Node
-refuses to accept through `NODE_OPTIONS`. Either launch with the flag directly:
+```
+node_modules/node-addon-require-builtin/build/napi/napi-v9-<platform>/require_builtin.node
+```
+
+Upstream (`github.com/deepseek-ai/dsh-node-addon-require-builtin`) is public, so
+the repair compiles the real addon rather than a look-alike. Two pieces make
+that work:
+
+- The source tree is vendored as the git submodule
+  `vendor/node-addon-require-builtin-src`, pinned to the revision the overlay
+  was written against. On Linux upstream builds with a plain `c++ -shared`
+  invocation, so no `pnpm`, `tsx` or `node-gyp` is involved and nothing needs
+  the network.
+- Upstream's N-API backend decodes the private getter's machine code per
+  architecture, and has no LoongArch64 entry — a stock source build loads and
+  then fails closed. `native/require-builtin/loong64/` is that missing port: it
+  recognizes the framed `ld.d $a0, $a0, imm; ...; ret` accessor LoongArch64 Node
+  emits, plus the dispatch, declaration and arch-name lines it needs. The overlay
+  is applied to a scratch copy of the submodule and every anchor must match
+  exactly once, so a moved upstream revision fails loudly instead of compiling
+  something subtly different. The node-addon-api headers upstream requires are
+  vendored under `native/require-builtin/node-addon-api/` for the same reason.
+
+The prebuild bundled with this tool is produced from that source by
+`npm run build:prebuild`, which compiles it, files it under
+`vendor/node-addon-require-builtin/<version>/<platform>/`, and then loads it back
+and calls `requireBuiltin()` before reporting success. The build-from-source
+strategy applies the same overlay for runtimes with no matching prebuild; it
+needs the submodule checked out (`git submodule update --init`), a C++ toolchain
+and Node headers.
+
+### Verifying it
+
+Upstream's `getNativeBindingInfo()` is a static descriptor compiled into the
+addon, so a binary that `require`s cleanly can still fail the private runtime
+probe. `nbr doctor` therefore calls `requireBuiltin()` itself; that call is the
+only thing that proves the probe resolved.
+
+With the binding repaired, `dsh`'s HMR service no longer needs
+`--expose-internals`: `@deepseek-ai/cordis-plugin-loader` and `dsh-app-boot`
+both fall back to `require('node-addon-require-builtin').requireBuiltin(id)`,
+which now works in a plain process.
+
+If a repair is not possible — the submodule is not checked out and no prebuild
+matches the runtime — the older workarounds still apply. Either launch with the
+flag directly:
 
 ```sh
 node --expose-internals "$(command -v dsh)" web
@@ -205,11 +251,32 @@ or set the profile to reload patches at startup instead of live, in
 ## Requirements
 
 - Node.js 20.9 or newer
-- For the build-from-source strategy only: a C/C++ toolchain and the relevant
-  development headers (`libvips-dev` and `libglib2.0-dev` for sharp)
+- For the build-from-source strategies only:
+  - a C/C++ toolchain plus Node's public headers (`<prefix>/include/node`)
+  - for sharp, the relevant development headers (`libvips-dev` and
+    `libglib2.0-dev`)
+  - for `node-addon-require-builtin`, the upstream submodule checked out
+    (`git submodule update --init vendor/node-addon-require-builtin-src`); the
+    node-addon-api headers it needs are vendored here
 
 The tool reports the exact install command for your package manager when those
 headers are missing.
+
+## Development
+
+The upstream source for `node-addon-require-builtin` is a submodule:
+
+```sh
+git clone --recurse-submodules <this repository>
+# or, in an existing checkout:
+git submodule update --init vendor/node-addon-require-builtin-src
+```
+
+Regenerate the bundled loong64 prebuild from that source with:
+
+```sh
+npm run build:prebuild
+```
 
 ## Environment variables
 
@@ -219,6 +286,9 @@ headers are missing.
 | `NBR_VERBOSE=1` | Preload logs what it repaired |
 | `NBR_TEST_SHARP_DIR` | Where the test suite finds a sharp install to copy fixtures from |
 | `NBR_TEST_VSCODE_RIPGREP_DIR` | Where the test suite finds a `@vscode/ripgrep` entry package to copy fixtures from |
+| `NBR_TEST_REQUIRE_BUILTIN_DIR` | Where the test suite finds a `node-addon-require-builtin` entry package to copy fixtures from |
+| `CXX` | Compiler used by the `node-addon-require-builtin` source build (defaults to `c++`, then `g++`, `clang++`) |
+| `NODE_INCLUDE_DIR` | Node public headers directory, when they are not under the running Node prefix |
 
 ## License
 
