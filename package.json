@@ -1,6 +1,6 @@
 {
   "name": "native-binding-repair",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Diagnose and automatically repair missing or unloadable native Node.js bindings: build prebuilds for unsupported platforms/architectures, or fall back to WebAssembly.",
   "type": "module",
   "license": "MIT",
