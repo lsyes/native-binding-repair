@@ -154,7 +154,7 @@ async function main() {
   const logger = createLogger({ verbose: options.verbose, quiet: options.quiet });
 
   if (options.version) {
-    logger.raw('0.1.1');
+    logger.raw('0.1.2');
     return 0;
   }
   if (options.help || options.command === '' || options.command === 'help') {
