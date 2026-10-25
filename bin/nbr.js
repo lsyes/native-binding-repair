@@ -8,6 +8,7 @@
  *   nbr repair sharp      repair one package
  *   nbr explain <log>     classify a captured failure log
  *   nbr prebuilds         list the bindings bundled with this tool
+ *   nbr update-upstream   follow the latest require-builtin source and rebuild
  */
 
 import fs from 'node:fs';
@@ -36,11 +37,16 @@ Commands
   hook remove           unregister the preload
   explain <file|->      classify a captured error log and print the recommended fix
   prebuilds             list prebuilt bindings bundled with this tool
+  update-upstream       update the vendored upstream source and rebuild its prebuild
   deps [pkg]            report missing system libraries
 
 Options
   --cwd <dir>           project directory to inspect (default: current directory)
   --dry-run             describe the actions without performing them
+  --check               report whether update-upstream has a newer source commit
+  --force               rebuild update-upstream even when the commit is current
+  --remote <name>       update-upstream git remote (default: origin)
+  --branch <name>       update-upstream branch (default: master)
   --no-repair           with run: never attempt a repair
   --json                emit machine-readable JSON
   --verbose             include per-step detail
@@ -52,6 +58,8 @@ Examples
   nbr doctor
   nbr repair sharp
   nbr repair @vscode/ripgrep
+  nbr update-upstream --check
+  nbr update-upstream
   nbr run -- dsh web
   dsh web 2>&1 | nbr explain -
   nbr repair --cwd /opt/app --verbose
@@ -74,6 +82,10 @@ function parseArgs(argv) {
     help: false,
     version: false,
     repair: true,
+    check: false,
+    force: false,
+    remote: 'origin',
+    branch: 'master',
   };
   const positional = [];
   for (let i = 0; i < argv.length; i++) {
@@ -90,6 +102,18 @@ function parseArgs(argv) {
       case '--dry-run':
       case '-n':
         options.dryRun = true;
+        break;
+      case '--check':
+        options.check = true;
+        break;
+      case '--force':
+        options.force = true;
+        break;
+      case '--remote':
+        options.remote = argv[++i] ?? options.remote;
+        break;
+      case '--branch':
+        options.branch = argv[++i] ?? options.branch;
         break;
       case '--json':
         options.json = true;
@@ -151,6 +175,8 @@ async function main() {
       return commandExplain(options, logger);
     case 'prebuilds':
       return commandPrebuilds(options, logger);
+    case 'update-upstream':
+      return commandUpdateUpstream(options, logger);
     case 'deps':
       return commandDeps(options, logger);
     default:
@@ -318,6 +344,44 @@ function commandExplain(options, logger) {
   logger.raw('');
   logger.raw(recommendation(verdict));
   return verdict.kind === 'unknown' ? 1 : 0;
+}
+
+/**
+ * `update-upstream`: fetch the latest upstream commit, rebuild the prebuild,
+ * and update the pinned commit in one transaction.
+ * @param {ReturnType<typeof parseArgs>} options
+ * @param {import('../lib/log.js').Logger} logger
+ */
+async function commandUpdateUpstream(options, logger) {
+  const { updateRequireBuiltinUpstream } = await import('../lib/upstream.js');
+  const report = updateRequireBuiltinUpstream({
+    remote: options.remote,
+    branch: options.branch,
+    check: options.check,
+    dryRun: options.dryRun,
+    force: options.force,
+    captureOutput: options.json,
+    logger: options.json ? createLogger({ quiet: true }) : logger,
+  });
+
+  if (options.json) {
+    logger.raw(JSON.stringify(report, null, 2));
+  } else if (report.status === 'updated') {
+    logger.ok(report.detail);
+  } else if (report.status === 'up-to-date') {
+    logger.ok(report.detail);
+  } else if (report.status === 'update-available') {
+    logger.warn(report.detail);
+    logger.info('run: nbr update-upstream');
+  } else if (report.status === 'would-update') {
+    logger.step(`dry run: ${report.detail}`);
+  } else {
+    logger.error(report.detail);
+  }
+
+  if (report.status === 'failed') return 1;
+  if (options.check && report.status === 'update-available') return 1;
+  return 0;
 }
 
 /**

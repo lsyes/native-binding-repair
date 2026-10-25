@@ -27,7 +27,9 @@
   "scripts": {
     "test": "node test/run.js",
     "doctor": "node bin/nbr.js doctor",
-    "build:prebuild": "node scripts/build-require-builtin-prebuild.js"
+    "build:prebuild": "node scripts/build-require-builtin-prebuild.js",
+    "update:upstream": "node bin/nbr.js update-upstream",
+    "update:upstream:check": "node bin/nbr.js update-upstream --check"
   },
   "keywords": [
     "native",

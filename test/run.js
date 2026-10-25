@@ -20,12 +20,15 @@ import { listVendored, lookupVendored, sharpBinaryName } from '../lib/vendor.js'
 import { linuxLibc, platformSuffix, sharpPlatform, nodeAbi } from '../lib/runtime.js';
 import { sharpBindingFilename, isPrebuiltPlatform } from '../lib/recipes/sharp.js';
 import {
+  REQUIRE_BUILTIN_BINARY_NAME,
   REQUIRE_BUILTIN_UPSTREAM_SRC,
   applyRequireBuiltinOverlay,
   probeRequireBuiltin,
   requireBuiltinBindingPath,
+  requireBuiltinUpstreamVersion,
 } from '../lib/recipes/require-builtin.js';
 import { buildRequireBuiltin, locateNodeAddonApi } from '../lib/strategies.js';
+import { updateRequireBuiltinUpstream } from '../lib/upstream.js';
 import { installHook, removeHook } from '../lib/hook.js';
 import { createLogger } from '../lib/log.js';
 import { globalModuleRoots } from '../lib/repair.js';
@@ -40,6 +43,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const packageRoot = path.resolve(here, '..');
 const cli = path.join(packageRoot, 'bin', 'nbr.js');
 const quietLogger = createLogger({ quiet: true });
+const requireBuiltinVersion = requireBuiltinUpstreamVersion() ?? '0.1.9';
 
 let passed = 0;
 let failed = 0;
@@ -67,6 +71,67 @@ async function test(name, fn) {
  */
 function scratch(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`));
+}
+
+/**
+ * Run git in a test repository.
+ * @param {string} cwd
+ * @param {string[]} args
+ * @returns {string}
+ */
+function testGit(cwd, args) {
+  return execFileSync('git', ['-C', cwd, ...args], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+}
+
+/**
+ * Create a local upstream repository, a seed checkout and a clean clone that
+ * stands in for the vendored submodule.
+ * @returns {{ root: string, remote: string, seed: string, work: string }}
+ */
+function makeUpstreamFixture() {
+  const root = scratch('nbr-upstream');
+  const remote = path.join(root, 'remote.git');
+  const seed = path.join(root, 'seed');
+  const work = path.join(root, 'work');
+
+  execFileSync('git', ['init', '--bare', '--initial-branch=master', remote], { stdio: 'ignore' });
+  fs.mkdirSync(seed, { recursive: true });
+  execFileSync('git', ['init', '--initial-branch=master', seed], { stdio: 'ignore' });
+  testGit(seed, ['config', 'user.name', 'nbr test']);
+  testGit(seed, ['config', 'user.email', 'nbr@example.invalid']);
+
+  fs.writeFileSync(
+    path.join(seed, 'package.json'),
+    `${JSON.stringify({ name: 'node-addon-require-builtin-workspace', version: '0.1.9' }, null, 2)}\n`,
+  );
+  fs.mkdirSync(path.join(seed, 'packages', 'native', 'src'), { recursive: true });
+  fs.writeFileSync(path.join(seed, 'packages', 'native', 'src', 'node_api_addon.cc'), '// fixture\n');
+  testGit(seed, ['add', '.']);
+  testGit(seed, ['commit', '-m', 'release 0.1.9']);
+  testGit(seed, ['remote', 'add', 'origin', remote]);
+  testGit(seed, ['push', '-u', 'origin', 'master']);
+  execFileSync('git', ['clone', remote, work], { stdio: 'ignore' });
+  return { root, remote, seed, work };
+}
+
+/**
+ * Publish another upstream release from the seed checkout.
+ * @param {{ seed: string }} fixture
+ * @param {string} version
+ * @returns {string} published commit
+ */
+function publishUpstreamVersion(fixture, version) {
+  fs.writeFileSync(
+    path.join(fixture.seed, 'package.json'),
+    `${JSON.stringify({ name: 'node-addon-require-builtin-workspace', version }, null, 2)}\n`,
+  );
+  testGit(fixture.seed, ['add', 'package.json']);
+  testGit(fixture.seed, ['commit', '-m', `release ${version}`]);
+  testGit(fixture.seed, ['push', 'origin', 'master']);
+  return testGit(fixture.seed, ['rev-parse', 'HEAD']);
 }
 
 /**
@@ -223,7 +288,7 @@ function makeFakeRequireBuiltin() {
     fs.mkdirSync(path.join(packageDir, 'lib'), { recursive: true });
     fs.writeFileSync(
       path.join(packageDir, 'package.json'),
-      JSON.stringify({ name: 'node-addon-require-builtin', version: '0.1.6', main: 'lib/index.js' }, null, 2),
+      JSON.stringify({ name: 'node-addon-require-builtin', version: requireBuiltinVersion, main: 'lib/index.js' }, null, 2),
     );
     fs.writeFileSync(path.join(packageDir, 'lib', 'index.js'), [
       "'use strict';",
@@ -385,11 +450,13 @@ process.stdout.write('\nnode-addon-require-builtin\n');
 await test('indexes the require-builtin addon built from upstream source', () => {
   if (sharpPlatform() !== 'linux-loong64') return; // the bundle is arch-specific
   const entry = listVendored().find(
-    (candidate) => candidate.package === 'node-addon-require-builtin',
+    (candidate) =>
+      candidate.package === 'node-addon-require-builtin'
+      && candidate.version === requireBuiltinVersion,
   );
-  assert.ok(entry, 'expected a vendored require_builtin for this platform');
+  assert.ok(entry, `expected a vendored require_builtin ${requireBuiltinVersion} for this platform`);
   assert.equal(entry.kind, 'addon');
-  assert.equal(entry.version, '0.1.6');
+  assert.equal(entry.version, '0.1.9');
   assert.equal(entry.file, 'require_builtin.node');
 });
 
@@ -429,15 +496,15 @@ await test('the loong64 overlay patches the pinned upstream tree', () => {
   applyRequireBuiltinOverlay(srcDir);
 
   for (const relative of [
-    path.join('runtime_context', 'linux_glibc_loong64.cc'),
-    path.join('runtime_probe', 'linux_glibc_loong64.cc'),
+    path.join('runtime_context', 'linux_loong64.cc'),
+    path.join('runtime_probe', 'linux_loong64.cc'),
   ]) {
     assert.equal(fs.existsSync(path.join(srcDir, relative)), true, `${relative} should be added`);
   }
-  assert.match(fs.readFileSync(path.join(srcDir, 'runtime_context', 'helper.h'), 'utf8'), /ReadLinuxGlibcLoong64CurrentV8Context/);
-  assert.match(fs.readFileSync(path.join(srcDir, 'runtime_probe', 'parser.h'), 'utf8'), /ParseLinuxGlibcLoong64BuiltinModuleRequireGetterOffset/);
-  assert.match(fs.readFileSync(path.join(srcDir, 'runtime_context', 'platform.cc'), 'utf8'), /__loongarch_lp64[\s\S]*ReadLinuxGlibcLoong64CurrentV8Context/);
-  assert.match(fs.readFileSync(path.join(srcDir, 'runtime_probe', 'platform.cc'), 'utf8'), /__loongarch_lp64[\s\S]*ParseLinuxGlibcLoong64BuiltinModuleRequireGetterOffset/);
+  assert.match(fs.readFileSync(path.join(srcDir, 'runtime_context', 'helper.h'), 'utf8'), /ReadLinuxLoong64CurrentV8Context/);
+  assert.match(fs.readFileSync(path.join(srcDir, 'runtime_probe', 'parser.h'), 'utf8'), /ParseLinuxLoong64BuiltinModuleRequireGetterOffset/);
+  assert.match(fs.readFileSync(path.join(srcDir, 'runtime_context', 'platform.cc'), 'utf8'), /__loongarch_lp64[\s\S]*ReadLinuxLoong64CurrentV8Context/);
+  assert.match(fs.readFileSync(path.join(srcDir, 'runtime_probe', 'platform.cc'), 'utf8'), /__loongarch_lp64[\s\S]*ParseLinuxLoong64BuiltinModuleRequireGetterOffset/);
   assert.match(fs.readFileSync(path.join(srcDir, 'native_types.cc'), 'utf8'), /"loong64"/);
   fs.rmSync(root, { recursive: true, force: true });
 });
@@ -489,6 +556,106 @@ await test('refuses to compile upstream sources into a different package version
   assert.equal(report.status, 'skipped');
   assert.match(report.detail, /9\.9\.9/);
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+await test('update-upstream --check reports a newer release without changing the checkout', () => {
+  const fixture = makeUpstreamFixture();
+  try {
+    const initial = testGit(fixture.work, ['rev-parse', 'HEAD']);
+    const target = publishUpstreamVersion(fixture, '0.1.10');
+    let rebuilt = false;
+    const report = updateRequireBuiltinUpstream({
+      repoDir: fixture.work,
+      check: true,
+      logger: quietLogger,
+      rebuild: () => {
+        rebuilt = true;
+      },
+    });
+    assert.equal(report.status, 'update-available');
+    assert.equal(report.targetCommit, target);
+    assert.equal(report.targetVersion, '0.1.10');
+    assert.equal(testGit(fixture.work, ['rev-parse', 'HEAD']), initial);
+    assert.equal(rebuilt, false, 'check must not compile or change the checkout');
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+await test('update-upstream rebuilds and advances the pinned upstream commit', () => {
+  const fixture = makeUpstreamFixture();
+  try {
+    const initial = testGit(fixture.work, ['rev-parse', 'HEAD']);
+    const target = publishUpstreamVersion(fixture, '0.1.10');
+    const pinFile = path.join(fixture.root, 'pin.js');
+    fs.writeFileSync(
+      pinFile,
+      `export const REQUIRE_BUILTIN_UPSTREAM_COMMIT =\n  '${initial}';\n`,
+    );
+
+    let rebuilt;
+    const report = updateRequireBuiltinUpstream({
+      repoDir: fixture.work,
+      vendorRoot: path.join(fixture.root, 'vendor'),
+      pinFile,
+      logger: quietLogger,
+      rebuild: (context) => {
+        rebuilt = context;
+        fs.mkdirSync(path.dirname(context.artifact), { recursive: true });
+        fs.writeFileSync(context.artifact, 'new prebuild\n');
+      },
+    });
+
+    assert.equal(report.status, 'updated');
+    assert.equal(report.currentVersion, '0.1.9');
+    assert.equal(report.targetVersion, '0.1.10');
+    assert.equal(rebuilt?.commit, target);
+    assert.equal(testGit(fixture.work, ['rev-parse', 'HEAD']), target);
+    assert.match(fs.readFileSync(pinFile, 'utf8'), new RegExp(target));
+    assert.equal(fs.readFileSync(report.artifact, 'utf8'), 'new prebuild\n');
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+await test('update-upstream rolls back a failed rebuild', () => {
+  const fixture = makeUpstreamFixture();
+  try {
+    const commit = testGit(fixture.work, ['rev-parse', 'HEAD']);
+    const pinFile = path.join(fixture.root, 'pin.js');
+    const pin = `export const REQUIRE_BUILTIN_UPSTREAM_COMMIT =\n  '${commit}';\n`;
+    fs.writeFileSync(pinFile, pin);
+    const artifact = path.join(
+      fixture.root,
+      'vendor',
+      'node-addon-require-builtin',
+      '0.1.9',
+      sharpPlatform(),
+      REQUIRE_BUILTIN_BINARY_NAME,
+    );
+    fs.mkdirSync(path.dirname(artifact), { recursive: true });
+    fs.writeFileSync(artifact, 'last good prebuild\n');
+
+    const report = updateRequireBuiltinUpstream({
+      repoDir: fixture.work,
+      vendorRoot: path.join(fixture.root, 'vendor'),
+      pinFile,
+      force: true,
+      logger: quietLogger,
+      rebuild: (context) => {
+        fs.writeFileSync(context.artifact, 'broken prebuild\n');
+        throw new Error('simulated compiler failure');
+      },
+    });
+
+    assert.equal(report.status, 'failed');
+    assert.equal(report.rolledBack, true);
+    assert.equal(testGit(fixture.work, ['rev-parse', 'HEAD']), commit);
+    assert.equal(fs.readFileSync(pinFile, 'utf8'), pin);
+    assert.equal(fs.readFileSync(artifact, 'utf8'), 'last good prebuild\n');
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
 });
 
 process.stdout.write('\nripgrep\n');
@@ -761,7 +928,7 @@ await test('global module roots point at real directories', () => {
 await test('help lists every documented command', () => {
   const { stdout, status } = runCliResult(['--help']);
   assert.equal(status, 0);
-  for (const command of ['doctor', 'repair', 'run', 'hook', 'explain', 'prebuilds', 'deps']) {
+  for (const command of ['doctor', 'repair', 'run', 'hook', 'explain', 'prebuilds', 'update-upstream', 'deps']) {
     assert.match(stdout, new RegExp(`\\b${command}\\b`), `help should mention ${command}`);
   }
 });

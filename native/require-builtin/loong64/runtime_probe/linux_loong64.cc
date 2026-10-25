@@ -3,7 +3,7 @@
 //
 // Overlaid onto `packages/native/src/` of vendor/node-addon-require-builtin-src
 // at build time; see lib/recipes/require-builtin.js. It is the LoongArch64
-// counterpart of runtime_probe/linux_glibc_x64.cc and keeps the same two-stage
+// counterpart of runtime_probe/linux_x64.cc and keeps the same two-stage
 // decode contract.
 //
 // On loong64 Node compiles `PrincipalRealm::builtin_module_require()` as a
@@ -174,11 +174,11 @@ Result<GetterPattern> MatchLoong64FieldGetter(void* getter,
 
 }  // namespace
 
-Result<GetterPattern> ParseLinuxGlibcLoong64BuiltinModuleRequireGetterOffset(
+Result<GetterPattern> ParseLinuxLoong64BuiltinModuleRequireGetterOffset(
     void* getter) {
   // The standard window first, then the 32-byte window the framed accessor
   // needs, matching the other Linux parsers.
-  return DecodeGetterWithWideWindowRetry(getter, "linux-glibc-loong64",
+  return DecodeGetterWithWideWindowRetry(getter, "linux-loong64",
                                          MatchLoong64FieldGetter);
 }
 

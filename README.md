@@ -103,6 +103,36 @@ dsh web 2>&1 | nbr explain -
 Lists the bindings bundled with this installation and marks which ones match the
 running runtime.
 
+### `nbr update-upstream`
+
+Follows upstream `node-addon-require-builtin` without leaving the vendored
+LoongArch64 port manually stale. The command fetches `origin/master`, resolves
+the latest release version from its `package.json`, updates the source submodule,
+applies and verifies the LoongArch64 overlay, rebuilds the prebuild, and calls
+`requireBuiltin()` before advancing the pinned commit.
+
+The operation is transactional. If the checkout, overlay anchors, compiler, or
+runtime probe fails, the previous submodule commit, prebuild, and pinned commit
+are restored.
+
+```sh
+# Report whether a newer upstream commit exists; exits 1 when one does.
+nbr update-upstream --check
+
+# Show the planned commit/version/build without changing anything.
+nbr update-upstream --dry-run
+
+# Fetch, rebuild for this runtime, and update the vendored artefact.
+nbr update-upstream
+
+# Rebuild the current source commit (for example after changing the overlay).
+nbr update-upstream --force
+```
+
+`--remote <name>` and `--branch <name>` override the defaults (`origin` and
+`master`). The command requires the source submodule, so it is intended for a
+repository checkout rather than an npm tarball installation.
+
 ### `nbr hook install` / `nbr hook remove`
 
 Registers or unregisters the preload in `package.json`. Existing scripts are
