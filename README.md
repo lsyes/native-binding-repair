@@ -57,12 +57,15 @@ tries the cheapest option first:
 | --- | --- | --- | --- | --- |
 | 1 | Bundled prebuild for this architecture | no | no | no |
 | 2 | Compile from source (`node-gyp`, or the upstream sources) | no | yes | no |
-| 3 | Platform optional dependency from the registry | yes | no | no |
-| 4 | WebAssembly fallback | no | no | no |
+| 3 | WebAssembly fallback | yes | no | no |
+| 4 | Platform optional dependency from the registry | yes | no | no |
 
 A bundled prebuild is what makes the common case work offline and without a
 compiler. When no bundle matches your platform, the tool tells you exactly which
-system libraries to install rather than failing with a stack trace.
+system libraries to install rather than failing with a stack trace. If those
+development headers are absent, it skips the source build that cannot succeed
+and tries the WebAssembly fallback instead (installing the matching
+`@img/sharp-wasm32` package from the registry when necessary).
 
 ## Commands
 

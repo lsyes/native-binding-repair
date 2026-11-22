@@ -468,11 +468,12 @@ function recommendation(verdict) {
       }
       return [
         'Recommended fix:',
-        '  nbr repair            # install a bundled prebuild, else build from source',
+        '  nbr repair            # install a bundled prebuild, build, or use wasm',
         '',
-        'If this package does not ship a prebuild for your architecture, compiling it',
-        'against the system library is usually the fastest route. On Debian/Ubuntu:',
-        '  sudo apt-get install -y libvips-dev',
+        'If there is no prebuild for this architecture, repair tries the WebAssembly',
+        'fallback when libvips development headers are unavailable. To build from',
+        'source instead, install the headers first. On Debian/Ubuntu:',
+        '  sudo apt-get install -y libvips-dev libglib2.0-dev',
         '  nbr repair sharp',
       ].join('\n');
     case 'missing-system-library':
